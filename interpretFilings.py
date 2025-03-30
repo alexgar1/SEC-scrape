@@ -8,84 +8,79 @@ import os
 from sklearn.linear_model import LinearRegression
 from sklearn.preprocessing import MinMaxScaler
 import numpy as np
+import json
+from bs4 import BeautifulSoup
 
-os.system('rm DATA/13Ftrain.feather')
-os.system('rm DATA/13Ftest.feather')
+
+
 
 # TODO
 # Include open price day of filing in training data
-# Figure out data pipeline for training data
+
 
 HEADERS = {
     "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7",
     "Accept-Language": "en-US,en;q=0.9",
     "Cache-Control": "max-age=0",
-    "Priority": "u=0, i",
-    "Referer": "https://www.sec.gov/Archives/edgar/data/1045810/000104581025000013/0001045810-25-000013-index.html",
-    "Sec-Ch-Ua": '"Not(A:Brand";v="99", "Google Chrome";v="133", "Chromium";v="133"',
-    "Sec-Ch-Ua-Mobile": "?0",
-    "Sec-Ch-Ua-Platform": "macOS",
-    "Sec-Fetch-Dest": "document",
-    "Sec-Fetch-Mode": "navigate",
-    "Sec-Fetch-Site": "same-origin",
-    "Sec-Fetch-User": "?1",
-    "Upgrade-Insecure-Requests": "1",
-    "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36",
+    "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/134.0.0.0 Safari/537.36"
 }
-PERIOD = 3 # number days to look back and forward for stock data
+BACKPERIOD = 10 # DAYS to look back and forward for stock data
+TESTPERIOD = 3 # DAYS post annoucement to assess a price movement (7 hours in normal market day).
+LOG = 'filinglog.txt'
 
-def saveToFeather(df, tablename):
-    if os.path.exists(tablename):
-        try:
-            existing_df = pd.read_feather(tablename)
-            df = pd.concat([existing_df, df], ignore_index=True)
-        except Exception as e:
-            print('Error reading or saving to feather table', e)
+# clean up
+open(LOG, 'w').close()
 
-    # Convert only non-list, non-dict, and non-int columns to string type
-    for col in df.columns:
-        if not df[col].apply(lambda x: isinstance(x, (list, dict, int))).all():
-            df[col] = df[col].astype(str)
-    
-    df.to_feather(tablename)
-    print('Saved to ' + tablename)
+def writelog(msg):
+    with open(LOG, 'a') as f:
+        f.write(msg + '\n')
+
+def saveJson(data, tablename):
+    with open(tablename+".json", "w") as f:
+        json.dump(data, f)
 
 
-def getTicker(company_name):
-    # url = f"https://query2.finance.yahoo.com/v1/finance/search?q={company_name}"
-    # response = requests.get(url, headers=HEADERS)
-    # if response.status_code == 200:
-    #     data = response.json()
-    #     if "quotes" in data and len(data["quotes"]) > 0:
-    #         return data["quotes"][0]["symbol"]
+
+def getTicker(company, verbose=False):
+    """
+    Enhanced ticker lookup with multiple fallback strategies
+    Returns: ticker (str) or None if not found
+    """
+    # Strategy 1: Original Yahoo Finance search
+    try:
+        yfinance_url = "https://query2.finance.yahoo.com/v1/finance/search"
+        user_agent = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/108.0.0.0 Safari/537.36'
+        params = {"q": company, "quotes_count": 1, "country": "United States"}
         
-    yfinance = "https://query2.finance.yahoo.com/v1/finance/search"
-    user_agent = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/108.0.0.0 Safari/537.36'
-    params = {"q": company_name, "quotes_count": 1, "country": "United States"}
+        res = requests.get(url=yfinance_url, params=params, headers={'User-Agent': user_agent})
+        data = res.json()
+        
+        if "quotes" in data and len(data["quotes"]) > 0:
+            if verbose: print(f"Found via Yahoo Finance API: {data['quotes'][0]['symbol']}")
+            return data['quotes'][0]['symbol']
+    except Exception as e:
+        if verbose: print(f"Yahoo Finance API failed: {str(e)}")
 
-    res = requests.get(url=yfinance, params=params, headers={'User-Agent': user_agent})
-    data = res.json()
 
-    if "quotes" in data and len(data["quotes"]) > 0:
-        return data['quotes'][0]['symbol']
-    
-    print(f'ERROR: Ticker for {company_name} not found')
-    return None
+
 
 
 def getOpenDays(date):
     # Get price info for the marker day before and after the filing date
     date = date.tz_localize(None)
     nyse = mcal.get_calendar('NYSE')
-    schedule = nyse.schedule(start_date=date - pd.Timedelta(days=7), end_date=date + pd.Timedelta(days=7))
-    last_market_day = schedule[schedule.index < date].index[-1-PERIOD]
-    next_market_day = schedule[schedule.index > date].index[PERIOD]
+    schedule = nyse.schedule(start_date=date - pd.Timedelta(days=int(BACKPERIOD*3)), end_date=date + pd.Timedelta(days=int(TESTPERIOD*3))) # start with broad calendar range
+    last_market_day = schedule[schedule.index < date].index[-1-BACKPERIOD]
+    next_market_day = schedule[schedule.index > date].index[TESTPERIOD]
     return last_market_day, next_market_day
 
 def getNumShares(start, ticker_info):
+    ''' Calculates the number of shares issued by a company at a specific time for 
+        to be used for market cap calculation
+    '''
     df = ticker_info.quarterly_income_stmt
     if df.empty:
-        print("No quarterly income statement data available.")
+        writelog("ERROR: No quarterly income statement data available.")
         return None
 
     def parse_date_from_col(col_name):
@@ -103,11 +98,9 @@ def getNumShares(start, ticker_info):
     for col in df.columns:
         cdate = parse_date_from_col(str(col))
         if cdate is not None and cdate <= start_date:
-            # This column is "on or before" the date we want
             valid_cols.append((col, cdate))
     if not valid_cols:
-        # Means no columns had a date <= start
-        print("No quarterly data columns are on or before", start_date)
+        writelog("No quarterly data columns are on or before", start_date)
         return None
 
     # We'll attempt both 'Basic Average Shares' and 'Diluted Average Shares'
@@ -121,16 +114,19 @@ def getNumShares(start, ticker_info):
                 if not pd.isna(val):
                     return val
 
-    print('No valid number of shares found.')
+    writelog('ERROR: No valid number of shares found.')
     return None
 
 
-
 def getPriceInfo(start, end, ticker, train, ticker_info=None):
-    # get stock price data
-    data = yf.download(ticker, start=start, end=end, interval="1h", auto_adjust=True)
+    ''' Gets stock price data over specified interval '''
+    if train: # if training get 
+        data = yf.download(ticker, start=start, end=end, interval="1d", auto_adjust=True)
+    else:
+        data = yf.download(ticker, start=start, end=end, interval="1h", auto_adjust=True)
+    
     if data.empty:
-        print(f"Error: No stock data found for {ticker} for the given period {start} to {end}")
+        writelog(f"ERROR: No stock data found for {ticker} for the given period {start} to {end}")
         return None
     
     if ticker_info is not None:
@@ -143,42 +139,46 @@ def getPriceInfo(start, end, ticker, train, ticker_info=None):
     
     # get the market cap at each time
     # this allows for the accurate size of the company and its movements to be taken into account
-    volume = data['Volume'].values.reshape(-1,1)
-    print(data['Close'])
-
-
-    if train:
+    if train: # TRAIN data
+        volume = [item[0] for item in data['Volume'].values.tolist()]
         realprice = [float(i[0] * shares) for i in data['Close'].values.reshape(-1,1)]
-        realpriceLs = realprice[-PERIOD*7:]
-        volumeLs = volume[-PERIOD*7:]
-        print('ååååæ',volumeLs)
+        realpriceLs = realprice[-BACKPERIOD:]
+        volumeLs = volume[-BACKPERIOD:]
         priceInfo = realpriceLs, volumeLs, data['Close'].iloc[-1]
         return priceInfo
-    else:
+    
+    else: # TEST data
         realprice = [float(i[0] * shares) for i in data['Open'].values.reshape(-1,1)]
-        train = {
-            'RealPrice': realprice[:PERIOD*7], 
-            'Volume': volume[:PERIOD*7]}
-        return train
+        priceInfo = {'RealPrice': realprice[:TESTPERIOD]}
+        return priceInfo
 
 
 
 def getStockInfo(issuer, filingdate, filer, prcntChng, diffShares):
     ''' 
     Gets stock info for testing a traiing for a given issuer
-        TRAIN: stock info and prices before announcement
-        TEST: stock RETURNS after announcment
+        TRAIN:
+            Holding info: (Market cap, Volume, EBIDTA, Debt-Cash)
+            Benchmark: (Market cap, Volume)
+            Filer info: (Market cap, Volume, 
+                        [of holding]: % change in shares, difference in shares, difference in dollars)
+
+        TEST:
+            Holding Market Cap and Volume
     '''
+    trainInfo = {} 
+
     ticker = getTicker(issuer)
     if not ticker:
+        writelog(f'ERROR: ticker for "{issuer}" not found')
         return None, None
     
     ticker_info = yf.Ticker(ticker)
-    
-    # Download data
+
+    # Find the open market days before and after the filing date
     before, after = getOpenDays(filingdate)
-    print(before, filingdate)
-    print('holding')
+
+    # HOLDING INFO
     holdingInfo = getPriceInfo(before, filingdate, ticker, train=True, ticker_info=ticker_info)
     if holdingInfo is None:
         return None, None
@@ -192,35 +192,35 @@ def getStockInfo(issuer, filingdate, filer, prcntChng, diffShares):
     debt = ticker_info.info.get('totalDebt', None)
     cash = ticker_info.info.get('totalCash', None)
 
-    # investment info
-    trainInfo = {} 
-
     # Convert keys in holdingPriceTrainData to strings
     trainInfo['holdingPriceTrainData'] = holdingPriceTrainData
     trainInfo['holdingVolume'] = holdingVolume
     trainInfo['EBITDA'] = ticker_info.info.get('ebitda', None)
     trainInfo['Debt-Cash'] = debt - cash if debt is not None and cash is not None else None
-    print('benchmark')
-    trainInfo['Benchmark'] = getPriceInfo(before, filingdate, '^GSPC', train=True)
 
-    # investor info
+    # BENCHMARK INFO (S&P 500)
+    benchmark = getPriceInfo(before, filingdate, '^GSPC', train=True)
+    trainInfo['benchmarkPrice'] = benchmark[0]
+    trainInfo['benchmarkVolume'] = benchmark[1]
+
+    # FILER INFO
     filerTicker = getTicker(filer)
-    print(filerTicker)
+    writelog(filerTicker)
     filerInfo = getPriceInfo(before, filingdate, filerTicker, train=True, ticker_info=yf.Ticker(filerTicker))
     if filerInfo is None:
         return None, None
     if filerInfo[0] is None or filerInfo[1] is None:
-        print(f"Error: No stock data found for filer {filerTicker} for the given period {before} to {filingdate}")
+        writelog(f"ERROR: No stock data found for filer {filerTicker} for the given period {before} to {filingdate}")
         return None, None
     trainInfo['filerPrices'] = filerInfo[0]
     trainInfo['filerVolume'] = filerInfo[1]
     trainInfo['percentChng'] = prcntChng
     trainInfo['diffShares'] = diffShares # how many more or less shares (negative if less)
-    trainInfo['diffDollars'] = diffShares * lastprice # " in dollars
+    trainInfo['diffDollars'] = diffShares * float(lastprice.iloc[0]) # " in dollars
 
     testInfo = getPriceInfo(filingdate, after, ticker, train=False, ticker_info=ticker_info)
     if testInfo is None:
-        print(f"Error: No stock data found for {ticker} for the given period {filingdate} to {after}")
+        writelog(f"ERROR: No stock data found for {ticker} for the given period {filingdate} to {after}")
         return None, None
 
     
@@ -232,7 +232,7 @@ def parseData():
         df_filings = pd.read_feather('DATA/filings.feather')
         df_holdings = pd.read_feather('DATA/holdings.feather')
     except Exception as e:
-        print("Error reading .feather files:", e)
+        writelog("ERROR reading .feather files:", e)
         sys.exit(1)
 
     if 'shares' not in df_holdings.columns:
@@ -254,10 +254,27 @@ def parseData():
     return grouped
 
 def getModelData(issuer, filing_date, filer, prcnt, diff, X, y):
+    '''
+    Data format:
+
+    train/test <- filer <- filing date <- issuer
+    
+    '''
     train, test = getStockInfo(issuer, filing_date, filer, prcnt, diff)
-    if train is not None and test is not None:
-        X[(filer, issuer, filing_date)] = train
-        y[(filer, issuer, filing_date)] = test
+    filing_date = filing_date.strftime('%Y-%m-%d %X')
+    
+    if not train or not test:  # Ensure valid data before proceeding
+        return X, y
+
+    # Use setdefault() to simplify dictionary initialization
+    try:
+        X.setdefault(filer, {}).setdefault(filing_date, {})[issuer] = train
+        y.setdefault(filer, {}).setdefault(filing_date, {})[issuer] = test
+    except:
+        print('ERROR building json for', filer, filing_date, issuer)
+        return X, y
+
+    return X, y
 
 
 def inferAction(grouped):
@@ -265,16 +282,16 @@ def inferAction(grouped):
     y = {}
 
     for filer, group_df in grouped:
-        print(filer)
         group_df = group_df.sort_values(by='date')
 
         prev_holdings = {}
         prev_date = None
 
-        print('='*5,filer,'='*5)
+        writelog('='*5 + filer + '='*5)
 
         for (filing_date, filing_id), filing_rows in group_df.groupby(['date','filing_id']):
-            print(f"\nFiling date: {filing_date}  (Filing ID: {filing_id})")
+            
+            writelog(f"\nFiling date: {filing_date}  (Filing ID: {filing_id})")
             current_holdings = {}
 
             for _, row in filing_rows.iterrows():
@@ -287,41 +304,36 @@ def inferAction(grouped):
                     oldShares = prev_holdings.get(issuer, 0)
 
                     if issuer not in prev_holdings:
-                        print(f"  BOUGHT NEW {curShares} shares of {issuer}")
-                        getModelData(issuer, filing_date, filer, 1, curShares, X, y)
+                        writelog(f"  BOUGHT NEW {curShares} shares of {issuer}")
+                        X, y = getModelData(issuer, filing_date, filer, 1, curShares, X, y)
 
                     elif curShares > oldShares:
                         diff = curShares - oldShares
-                        print(f"  BOUGHT MORE {diff} shares of {issuer}")
-                        getModelData(issuer, filing_date, filer, curShares/oldShares, diff, X, y)
+                        writelog(f"  BOUGHT MORE {diff} shares of {issuer}")
+                        X, y = getModelData(issuer, filing_date, filer, curShares/oldShares, diff, X, y)
 
                     elif curShares < oldShares:
                         diff = curShares - oldShares
-                        print(f"  SOLD SOME {-diff} shares of {issuer}")
-                        getModelData(issuer, filing_date, filer, curShares/oldShares, diff, X, y)
+                        writelog(f"  SOLD SOME {-diff} shares of {issuer}")
+                        X, y = getModelData(issuer, filing_date, filer, curShares/oldShares, diff, X, y)
 
                 for issuer, oldShares in prev_holdings.items():
                     if issuer not in current_holdings:
-                        print(f"  SOLD ALL {oldShares} shares of {issuer}")
-                        getModelData(issuer, filing_date, filer, -1, -oldShares, X, y)
-
-            # else:
-            #     print("  (No prior filing to compare)")
+                        writelog(f"  SOLD ALL {oldShares} shares of {issuer}")
+                        X, y = getModelData(issuer, filing_date, filer, -1, -oldShares, X, y)
 
             prev_holdings = current_holdings
             prev_date = filing_date
 
-
-
-    saveToFeather(pd.DataFrame(X), 'DATA/13Ftrain.feather')
-    saveToFeather(pd.DataFrame(y), 'DATA/13Ftest.feather')
+    saveJson(X, 'DATA/13Ftrain')
+    saveJson(y, 'DATA/13Ftest')
 
 def main():
     start_time = time.time()
     data = parseData()
     inferAction(data)
     end_time = time.time()
-    print("Total execution time:", end_time - start_time)
+    writelog("Total execution time:" + str(end_time - start_time))
 
 
 if __name__ == "__main__":
