@@ -14,16 +14,17 @@ python trainTradeModel.py
 All artefacts are written to DATA/.
 
 ### Project layout
+```text
 .
-├─ scrape.py              # EDGAR crawler → *.feather (13-F filings & holdings)
-├─ interpretFilings.py    # Feature builder → X.json / y.json
-├─ trainTradeModel.py     # ML training / back-test report
-└─ DATA/
-   ├─ filings.feather     # Saved by scrape.py
-   ├─ holdings.feather    # Saved by scrape.py
-   ├─ X.json              # Training features
-   ├─ y.json              # Labels / test returns
-   └─ tickerCache         # Thread-safe on-disk cache (sqlite-shelve)	
+├── scrape.py              # EDGAR crawler → *.feather (13-F filings & holdings)
+├── interpretFilings.py    # Feature builder → X.json / y.json
+├── trainTradeModel.py     # ML training / back-test report
+└── DATA/
+    ├── filings.feather    # Saved by scrape.py
+    ├── holdings.feather   # Saved by scrape.py
+    ├── X.json             # Training features
+    ├── y.json             # Labels / test returns
+    └── tickerCache        # Thread-safe on-disk cache (sqlite-shelve)
 
 
 ## What each stage does
