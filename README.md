@@ -25,7 +25,7 @@ All artefacts are written to DATA/.
     ├── X.json             # Training features
     ├── y.json             # Labels / test returns
     └── tickerCache        # Thread-safe on-disk cache (sqlite-shelve)
-
+```
 
 ## What each stage does
 ### scrape.py	
