@@ -39,7 +39,8 @@ All artefacts are written to DATA/.
 ▸ Trains Logistic Regression, Random Forest, XGBoost, and a small Keras NN
 ▸ Prints classification metrics plus a naïve “buy if prob > 0.5” trading simulation
 
-Road-map / TODO
+
+## TODO
 Extend scraper to 10-K & 8-K (bulk fundamentals & sentiment NLP).
 Replace shelve with SQL for concurrent safe caching.
 Add walk-forward CV and adaptive position-sizing in back-test.
