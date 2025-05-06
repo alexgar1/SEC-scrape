@@ -1,14 +1,64 @@
 ### Written by Alex Garrett alexgarrett2468[at]gmail.com 2025
 
+# This script scrapes the sec edgar database for 13f filings without using the API (the free API caps requests at 100)
+# 1. Accesses company filings archive
+# 2. Searches for 13F filings
+# 3. Extracts company holdings and saves them to a table
+
+
+# TODO
+# Implement scraping for 8k and 10k filings.
+# Extract financial information and perform NLP for sentiment analysis
+
+
+
 import re, requests, time, os
 from bs4 import BeautifulSoup
 import pandas as pd
 import yfinance as yf
+import json
 
+
+TEST = True
+
+if not TEST:
+    os.system('rm DATA/holdings.feather')
+    os.system('rm DATA/filings.feather')
+    FILINGDB = 'DATA/filings.feather'
+    HOLDINGDB = 'DATA/holdings.feather'
+
+else:
+    os.system('rm DATA/TESTholdings.feather')
+    os.system('rm DATA/TESTfilings.feather')
+    FILINGDB = 'DATA/TESTfilings.feather'
+    HOLDINGDB = 'DATA/TESTholdings.feather'
+
+HEADERS = {
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7",
+    "Accept-Language": "en-US,en;q=0.9",
+    "Cache-Control": "max-age=0",
+    "Priority": "u=0, i",
+    "Sec-Ch-Ua": '"Not(A:Brand";v="99", "Google Chrome";v="133", "Chromium";v="133"',
+    "Sec-Ch-Ua-Mobile": "?0",
+    "Sec-Ch-Ua-Platform": "macOS",
+    "Sec-Fetch-Dest": "document",
+    "Sec-Fetch-Mode": "navigate",
+    "Sec-Fetch-Site": "same-origin",
+    "Sec-Fetch-User": "?1",
+    "Upgrade-Insecure-Requests": "1",
+    "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36",
+}
 
 URL = "https://www.sec.gov/"
+CIKFILE = 'companyCIK.json'
 NVIDIA = ('NVIDIA','Archives/edgar/data/1045810/')
 AMAZON = ('AMAZON','Archives/edgar/data/1018724')
+TESLA = ('TESLA','Archives/edgar/data/1318605')
+APPLE = ('APPLE','Archives/edgar/data/320193') ### 
+MICROSOFT = ('MICROSOFT','Archives/edgar/data/789019')
+SCION = ('SCION ASSET MANAGEMENT, LLC','Archives/edgar/data/1649339')
+BERKLEY = ('BERKLEY, INC', 'Archives/edgar/data/2051965')
+
 
 pattern_folder = re.compile(
     r'<td><a href="(?P<href>/Archives/edgar/data/\d+/\d+)".*?</a></td><td></td><td>(?P<date>\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})</td>',
@@ -39,10 +89,6 @@ pattern_infotable = re.compile(
     r'<td.*?><a href="([^"]+)".*?</a></td>\s*<td.*?>INFORMATION TABLE</td>',
     re.IGNORECASE
 )
-# pattern_info_table = re.compile(
-#     r'<a\s+href="([^"]+information_table\.xml)"',
-#     re.IGNORECASE
-# )
 
 def saveToFeather(df, tablename):    
     if os.path.exists(tablename):
@@ -53,7 +99,7 @@ def saveToFeather(df, tablename):
             print('Error reading or saving to feather table', e)
             
     df.to_feather(tablename)
-    print('Saved to',tablename)
+    print('Saved to', tablename)
 
 def extractInvestments(html_content, filingid):
     """
@@ -69,12 +115,10 @@ def extractInvestments(html_content, filingid):
     for row in table_rows:
         columns = row.find_all('td')
         
-        # We expect at least 7 columns for a valid data row
         if len(columns) < 7:
             continue
         
         try:
-            # Pull text from each cell, stripping whitespace and unwanted chars
             name_of_issuer = columns[0].get_text(strip=True).upper()
             title_of_class = columns[1].get_text(strip=True).upper()
             cusip = columns[2].get_text(strip=True)
@@ -102,21 +146,21 @@ def extractInvestments(html_content, filingid):
         
             
         except ValueError:
-            # This typically indicates a header or non-numeric row; skip it
             continue
+
 
     df = pd.DataFrame(holdings)
     print(df)
 
     if df.empty:
         print("No valid holdings extracted.")
-        return
+        return False
 
-    saveToFeather(df, 'holdings.feather')
+    saveToFeather(df, HOLDINGDB)
 
-    return 
+    return True
 
-def getCompany13F(company, quant=3):
+def getCompany13F(name, cik, quant=3, timeout=30):
     """
     This function scrapes the SEC website for 13F filings from a given company
     and retrieves asset information.
@@ -127,80 +171,119 @@ def getCompany13F(company, quant=3):
     4. Record all holdings and parse their information.
     """
 
-    headers = {"User-Agent": "MyCompany (myemail@company.com)"}
-
-    r = requests.get(URL + company[1], headers=headers) # company filing dir
-    r.raise_for_status()  # Raises an HTTPError if the response was an error
-    main_text = r.text
+    headers = HEADERS
     filings = []
-    succ = 0
+    succ = 1
+    
     try:
+        # Start the overall timer
+        overall_start = time.time()
+        
+        # Fetch the company filing directory
+        r = requests.get(URL + 'Archives/edgar/data/'+cik, headers=headers, timeout=10)  # Added timeout for initial request
+        r.raise_for_status()
+        main_text = r.text
+        
         folder_links = pattern_folder.findall(main_text)
+        if not folder_links:
+            print(f"No folder links found for {name}")
+            return
 
-        start_time = time.time()
+        print('='*5, name, '='*5)
+        
         for filing, date in folder_links:
+            if time.time() - overall_start > timeout:
+                print(f"Timeout reached after {timeout} seconds, moving to next filer")
+                break
+                
             if succ > quant:
                 break
-
-            # Fetch the filing page.
-            filing_url = URL + filing
-            r2 = requests.get(filing_url, headers=headers)
-            r2.raise_for_status()
-            filing_text = r2.text
-
-            # Fetch filing detail
-            match_index = pattern_index.search(filing_text)
-            if not match_index:
-                continue
-            detail_href = match_index.group(1)
-            detail_url = URL + detail_href
-            r3 = requests.get(detail_url, headers=headers)
-            r3.raise_for_status()
-            detail_text = r3.text
-
-            # Find Accession Number (filing_id)
-            match_filingid = pattern_filingid.search(detail_text)
-            filingid = match_filingid.group(1)
-            filings.append({
-                'filing_id': filingid,
-                'cik': filingid[:10],
-                'filer_name': company[0], # company name
-                'date': date
-                })
             
-            # TODO: modify patter to not depend on filename but previous cell entitled 'information table'
-            match_info = pattern_infotable.search(detail_text)
-            if not match_info:
+            try:
+                # Fetch the filing page with timeout
+                filing_url = URL + filing
+                r2 = requests.get(filing_url, headers=headers, timeout=10)
+                r2.raise_for_status()
+                filing_text = r2.text
+
+                # Fetch filing detail with timeout
+                match_index = pattern_index.search(filing_text)
+                if not match_index:
+                    continue
+                    
+                detail_href = match_index.group(1)
+                detail_url = URL + detail_href
+                r3 = requests.get(detail_url, headers=headers, timeout=10)
+                r3.raise_for_status()
+                detail_text = r3.text
+
+                # Find Accession Number (filing_id)
+                match_filingid = pattern_filingid.search(detail_text)
+                filingid = match_filingid.group(1)
+                filinginfo = {
+                    'filing_id': filingid,
+                    'filing_type': '13F',
+                    'cik': filingid[:10],
+                    'filer_name': name,
+                    'date': pd.to_datetime(date, errors='coerce')
+                }
+                
+                filingdf = pd.DataFrame([filinginfo])
+
+                if filingdf.empty:
+                    print("No valid holdings extracted.")
+                    continue
+                
+                # Get href to holding info
+                match_info = pattern_infotable.search(detail_text)
+                if not match_info:
+                    continue
+                    
+                info_table_href = match_info.group(1)
+
+                # Scrape holdings with timeout
+                info = requests.get(URL + info_table_href, headers=headers, timeout=10).text
+                print(name, date)
+                
+                if extractInvestments(info, filingid):
+                    saveToFeather(filingdf, FILINGDB)
+
+                succ += 1
+                filing_time = time.time() - overall_start
+                print(f"Filing scrape time: {filing_time:.2f} seconds")
+                overall_start = time.time()
+                
+            except requests.exceptions.Timeout:
+                print(f"Timeout occurred while processing filing {filing}, skipping")
                 continue
-            info_table_href = match_info.group(1)
-            print('ASDF',info_table_href)
+            except requests.exceptions.RequestException as e:
+                print(f"Request error occurred: {e}, skipping this filing")
+                continue
+            except Exception as e:
+                print(f"Unexpected error processing filing: {e}, skipping this filing")
+                continue
 
-            # Scrape holdings
-            info = requests.get(URL + info_table_href, headers=headers).text
-            print(company[0], date)
-            extractInvestments(info, filingid)
-            succ += 1
-            end_time = time.time()
-            print("Filing scrape time:", end_time - start_time)
-            start_time = time.time()
-
-            # break # this only gets the latest filing; remove to get all filings
-
-    except Exception as e:
-        print("Error during scraping 13F filings", e)
-
-    df = pd.DataFrame(filings)
-
-    if df.empty:
-        print("No valid holdings extracted.")
+    except requests.exceptions.Timeout:
+        print(f"Initial request for {name} timed out, moving to next filer")
         return
-    
-    saveToFeather(df, 'filings.feather')
+    except Exception as e:
+        print(f"Error during scraping 13F filings for {name}:\n{e}")
+        return
+
+
 
 
 def main():
     start_time = time.time()
-    getCompany13F(NVIDIA)
+    with open(CIKFILE,'r') as f:
+        ciks = json.load(f)
+
+    for i, key in enumerate(ciks):
+        if i < 2:
+            company_info = ciks[key]
+            getCompany13F(company_info['title'], str(company_info['cik_str']), 2)
+            print('Saved', i, 'companies')
+
     end_time = time.time()
     print("Total execution time:", end_time - start_time)
 
