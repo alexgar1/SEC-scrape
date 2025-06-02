@@ -5,33 +5,40 @@
 # 2. Searches for 13F filings
 # 3. Extracts company holdings and saves them to a table
 
-
 # TODO
 # Implement scraping for 8k and 10k filings.
 # Extract financial information and perform NLP for sentiment analysis
-
-
 
 import re, requests, time, os
 from bs4 import BeautifulSoup
 import pandas as pd
 import yfinance as yf
+import duckdb
 import json
+from tqdm import tqdm
+from concurrent.futures import ThreadPoolExecutor, as_completed
+import logging
+import threading
+import itertools
+import random
+from sshtunnel import open_tunnel          # pip install sshtunnel
+import requests, threading
+import os
+from dotenv import load_dotenv, find_dotenv
+import socks
 
 
-TEST = True
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(threadName)s %(message)s",
+    handlers=[
+        logging.FileHandler("LOGS/scrapeNEW.txt", mode="w")
+    ]
+)
+logger = logging.getLogger(__name__)
 
-if not TEST:
-    os.system('rm DATA/holdings.feather')
-    os.system('rm DATA/filings.feather')
-    FILINGDB = 'DATA/filings.feather'
-    HOLDINGDB = 'DATA/holdings.feather'
+DB_FILE = 'DATA/sec_filingsNEW.duckdb'
 
-else:
-    os.system('rm DATA/TESTholdings.feather')
-    os.system('rm DATA/TESTfilings.feather')
-    FILINGDB = 'DATA/TESTfilings.feather'
-    HOLDINGDB = 'DATA/TESTholdings.feather'
 
 HEADERS = {
     "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7",
@@ -50,15 +57,7 @@ HEADERS = {
 }
 
 URL = "https://www.sec.gov/"
-CIKFILE = 'companyCIK.json'
-NVIDIA = ('NVIDIA','Archives/edgar/data/1045810/')
-AMAZON = ('AMAZON','Archives/edgar/data/1018724')
-TESLA = ('TESLA','Archives/edgar/data/1318605')
-APPLE = ('APPLE','Archives/edgar/data/320193') ### 
-MICROSOFT = ('MICROSOFT','Archives/edgar/data/789019')
-SCION = ('SCION ASSET MANAGEMENT, LLC','Archives/edgar/data/1649339')
-BERKLEY = ('BERKLEY, INC', 'Archives/edgar/data/2051965')
-
+CIKFILE = 'DATA/companyCIK.json'
 
 pattern_folder = re.compile(
     r'<td><a href="(?P<href>/Archives/edgar/data/\d+/\d+)".*?</a></td><td></td><td>(?P<date>\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})</td>',
@@ -84,22 +83,88 @@ pattern_filingid = re.compile( # actually called the 'Acession Number'
     r'(\d{10}-\d{2}-\d{6})',
     re.IGNORECASE
 )
-# TODO: modify patter to not depend on filename but previous cell entitled 'information table'
+# TODO: modify pattern to not depend on filename but previous cell entitled 'information table'
 pattern_infotable = re.compile(
     r'<td.*?><a href="([^"]+)".*?</a></td>\s*<td.*?>INFORMATION TABLE</td>',
     re.IGNORECASE
 )
 
-def saveToFeather(df, tablename):    
-    if os.path.exists(tablename):
+# connect and initialize DuckDB
+conn = duckdb.connect(DB_FILE)
+conn.execute("""
+CREATE TABLE IF NOT EXISTS filings (
+    filing_id VARCHAR PRIMARY KEY,
+    filing_type VARCHAR,
+    cik VARCHAR,
+    filer_name VARCHAR,
+    date TIMESTAMP
+)
+""")
+conn.execute("""
+CREATE TABLE IF NOT EXISTS holdings (
+    id VARCHAR,
+    nameOfIssuer VARCHAR,
+    titleOfClass VARCHAR,
+    cusip VARCHAR,
+    value BIGINT,
+    sshPrnamt BIGINT,
+    putCall VARCHAR,
+    FOREIGN KEY(id) REFERENCES filings(filing_id)
+)
+""")
+
+def save_filings(df: pd.DataFrame):    
+    # upsert into filings
+    conn.register('tmp_filings', df)
+    conn.execute('''
+    INSERT INTO filings SELECT * FROM tmp_filings
+    ON CONFLICT (filing_id) DO UPDATE SET
+      filing_type = EXCLUDED.filing_type,
+      cik = EXCLUDED.cik,
+      filer_name = EXCLUDED.filer_name,
+      date = EXCLUDED.date;
+    ''' )
+    conn.unregister('tmp_filings')
+    logger.info('Filings saved to DuckDB')
+
+def save_holdings(df: pd.DataFrame):
+    # normalize nested column
+    df = df.assign(sshPrnamt=df['shrsOrPrnAmt'].apply(lambda x: x.get('sshPrnamt', None)))
+    df = df.drop(columns=['shrsOrPrnAmt'])
+    conn.register('tmp_holdings', df)
+    conn.execute('''
+    INSERT INTO holdings (id, nameOfIssuer, titleOfClass, cusip, value, sshPrnamt, putCall)
+    SELECT id, nameOfIssuer, titleOfClass, cusip, value, sshPrnamt, putCall FROM tmp_holdings;
+    ''')
+    conn.unregister('tmp_holdings')
+    logger.info('Holdings saved to DuckDB')
+
+
+def backoffFn(fn, *args, **kwargs):
+    """
+    Retry fn(*args, **kwargs) on HTTP 401/429, with exponential backoff.
+    """
+    delays = itertools.chain([1, 2, 4, 8, 16], itertools.repeat(30))
+    for delay in delays:
         try:
-            existing_df = pd.read_feather(tablename)
-            df = pd.concat([existing_df, df], ignore_index=True)
-        except Exception as e:
-            print('Error reading or saving to feather table', e)
-            
-    df.to_feather(tablename)
-    print('Saved to', tablename)
+            resp = fn(*args, **kwargs)
+            # some libraries don’t raise on 429, so check status
+            if hasattr(resp, "status_code") and resp.status_code in (401, 429):
+                raise requests.HTTPError(response=resp)
+            if resp.status_code != 200:
+                logger.warning(f"Request failed with status code: {resp.status_code}")
+            return resp
+        except requests.HTTPError as e:
+            code = e.response.status_code if e.response else None
+            if code in (401, 429):
+                logger.warning(f"Rate‐limited ({code}), retrying in {delay}s…")
+                time.sleep(delay)
+                continue
+            raise
+        except requests.RequestException as e:
+            # optionally retry on other transient errors
+            logger.error(f"Network error {e}, retrying in {delay}s…")
+            time.sleep(delay)
 
 def extractInvestments(html_content, filingid):
     """
@@ -150,17 +215,17 @@ def extractInvestments(html_content, filingid):
 
 
     df = pd.DataFrame(holdings)
-    print(df)
+    logger.info(df)
 
     if df.empty:
-        print("No valid holdings extracted.")
+        logger.info("No valid holdings extracted.")
         return False
 
-    saveToFeather(df, HOLDINGDB)
+    save_holdings(df)
 
     return True
 
-def getCompany13F(name, cik, quant=3, timeout=30):
+def getCompany13F(name, cik, quant=3, timeout=60):
     """
     This function scrapes the SEC website for 13F filings from a given company
     and retrieves asset information.
@@ -173,27 +238,35 @@ def getCompany13F(name, cik, quant=3, timeout=30):
 
     headers = HEADERS
     filings = []
-    succ = 1
+    succ = 0
     
     try:
         # Start the overall timer
         overall_start = time.time()
         
         # Fetch the company filing directory
-        r = requests.get(URL + 'Archives/edgar/data/'+cik, headers=headers, timeout=10)  # Added timeout for initial request
+        LATESTURL = URL + f'/edgar/search/#/q=13f-hr&entityName={(10-len(cik))*'0'}{cik}'
+        logger.info(f"Fetching filings for {name} (CIK: {cik}) at URL: {LATESTURL}")
+        r = backoffFn(requests.get, LATESTURL, headers=headers, timeout=10)  # Added timeout for initial request
         r.raise_for_status()
         main_text = r.text
         
-        folder_links = pattern_folder.findall(main_text)
+        soup = BeautifulSoup(main_text, "lxml")
+        folder_links = [
+            a["href"] for a in soup.select('a.preview-file')
+            if a.text.startswith("13F-HR")
+        ]
         if not folder_links:
-            print(f"No folder links found for {name}")
-            return
+            logger.info(f"No folder links found for {name}")
+            return 0
+        
+        logger.info(f"Found {len(folder_links)} folder links for {name}")
 
-        print('='*5, name, '='*5)
+        logger.info(f"{'='*5} {name} {'='*5}")
         
         for filing, date in folder_links:
             if time.time() - overall_start > timeout:
-                print(f"Timeout reached after {timeout} seconds, moving to next filer")
+                logger.info(f"Timeout reached after {timeout} seconds, moving to next filer")
                 break
                 
             if succ > quant:
@@ -202,7 +275,7 @@ def getCompany13F(name, cik, quant=3, timeout=30):
             try:
                 # Fetch the filing page with timeout
                 filing_url = URL + filing
-                r2 = requests.get(filing_url, headers=headers, timeout=10)
+                r2 = backoffFn(requests.get, filing_url, headers=headers, timeout=10)
                 r2.raise_for_status()
                 filing_text = r2.text
 
@@ -210,10 +283,11 @@ def getCompany13F(name, cik, quant=3, timeout=30):
                 match_index = pattern_index.search(filing_text)
                 if not match_index:
                     continue
-                    
+                
                 detail_href = match_index.group(1)
+
                 detail_url = URL + detail_href
-                r3 = requests.get(detail_url, headers=headers, timeout=10)
+                r3 = backoffFn(requests.get, detail_url, headers=headers, timeout=10)
                 r3.raise_for_status()
                 detail_text = r3.text
 
@@ -231,7 +305,7 @@ def getCompany13F(name, cik, quant=3, timeout=30):
                 filingdf = pd.DataFrame([filinginfo])
 
                 if filingdf.empty:
-                    print("No valid holdings extracted.")
+                    logger.info("No valid holdings extracted.")
                     continue
                 
                 # Get href to holding info
@@ -242,33 +316,43 @@ def getCompany13F(name, cik, quant=3, timeout=30):
                 info_table_href = match_info.group(1)
 
                 # Scrape holdings with timeout
-                info = requests.get(URL + info_table_href, headers=headers, timeout=10).text
-                print(name, date)
+                logger.info(f"Fetching holdings page {info_table_href} for {name}")
+                info = backoffFn(requests.get, URL + info_table_href, headers=headers, timeout=10).text
+                logger.info(f'{name} {date}')
                 
-                if extractInvestments(info, filingid):
-                    saveToFeather(filingdf, FILINGDB)
+                conn.begin()
+                try:
+                    save_filings(filingdf)          # parent first
+                    extractInvestments(info, filingid)  # children second
+                    conn.commit()
+                except Exception:
+                    conn.rollback()
+                    raise
 
                 succ += 1
                 filing_time = time.time() - overall_start
-                print(f"Filing scrape time: {filing_time:.2f} seconds")
+                logger.info(f"Filing scrape time: {filing_time:.2f} seconds")
                 overall_start = time.time()
+
                 
             except requests.exceptions.Timeout:
-                print(f"Timeout occurred while processing filing {filing}, skipping")
+                logger.info(f"Timeout occurred while processing filing {filing}, skipping")
                 continue
             except requests.exceptions.RequestException as e:
-                print(f"Request error occurred: {e}, skipping this filing")
+                logger.info(f"Request error occurred: {e}, skipping this filing")
                 continue
             except Exception as e:
-                print(f"Unexpected error processing filing: {e}, skipping this filing")
+                logger.info(f"Unexpected error processing filing: {e}, skipping this filing")
                 continue
 
     except requests.exceptions.Timeout:
-        print(f"Initial request for {name} timed out, moving to next filer")
-        return
+        logger.info(f"Initial request for {name} timed out, moving to next filer")
+        return 0
     except Exception as e:
-        print(f"Error during scraping 13F filings for {name}:\n{e}")
-        return
+        logger.info(f"Error during scraping 13F filings for {name}:\n{e}")
+        return 0 
+    
+    return succ
 
 
 
@@ -278,14 +362,18 @@ def main():
     with open(CIKFILE,'r') as f:
         ciks = json.load(f)
 
-    for i, key in enumerate(ciks):
-        if i < 2:
-            company_info = ciks[key]
-            getCompany13F(company_info['title'], str(company_info['cik_str']), 2)
-            print('Saved', i, 'companies')
+    total = 0
+    i = 0
+    for key in tqdm(ciks):
+        company_info = ciks[key]
+        succ = getCompany13F(company_info['title'], str(company_info['cik_str']))
+        if succ > 0:
+            total += succ
+            i += 1
+            logger.info(f'Saved {total} filings from {i} companies')
 
     end_time = time.time()
-    print("Total execution time:", end_time - start_time)
+    logger.info(f"Total execution time: {end_time - start_time}")
 
 if __name__ == "__main__":
     main()
